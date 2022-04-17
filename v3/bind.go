@@ -395,17 +395,10 @@ func (l *Conn) ExternalBind() error {
 type NTLMBindRequest struct {
 	// Domain is the AD Domain to authenticate too. If not specified, it will be grabbed from the NTLMSSP Challenge
 	Domain string
-	// Username is the name of the Directory object that the client wishes to bind as
-	Username string
-	// Password is the credentials to bind with
-	Password string
-	// AllowEmptyPassword sets whether the client allows binding with an empty password
-	// (normally used for unauthenticated bind).
-	AllowEmptyPassword bool
-	// Hash is the hex NTLM hash to bind with. Password or hash must be provided
-	Hash string
 	// Controls are optional controls to send with the bind request
-	Controls []Control
+	Controls               []Control
+	createNegotiateMessage func() ([]byte, error)
+	processChallenge       func([]byte) ([]byte, error)
 }
 
 func (req *NTLMBindRequest) appendTo(envelope *ber.Packet) error {
@@ -414,7 +407,7 @@ func (req *NTLMBindRequest) appendTo(envelope *ber.Packet) error {
 	request.AppendChild(ber.NewString(ber.ClassUniversal, ber.TypePrimitive, ber.TagOctetString, "", "User Name"))
 
 	// generate an NTLMSSP Negotiation message for the  specified domain (it can be blank)
-	negMessage, err := ntlmssp.NewNegotiateMessage(req.Domain, "")
+	negMessage, err := req.createNegotiateMessage()
 	if err != nil {
 		return fmt.Errorf("err creating negmessage: %s", err)
 	}
@@ -436,10 +429,17 @@ type NTLMBindResult struct {
 
 // NTLMBind performs an NTLMSSP Bind with the given domain, username and password
 func (l *Conn) NTLMBind(domain, username, password string) error {
+	if password == "" {
+		return NewError(ErrorEmptyPassword, errors.New("ldap: empty password not allowed by the client"))
+	}
 	req := &NTLMBindRequest{
-		Domain:   domain,
-		Username: username,
-		Password: password,
+		Domain: domain,
+		createNegotiateMessage: func() ([]byte, error) {
+			return ntlmssp.NewNegotiateMessage(domain, "")
+		},
+		processChallenge: func(challenge []byte) ([]byte, error) {
+			return ntlmssp.ProcessChallenge(challenge, username, password)
+		},
 	}
 	_, err := l.NTLMChallengeBind(req)
 	return err
@@ -453,9 +453,12 @@ func (l *Conn) NTLMBind(domain, username, password string) error {
 func (l *Conn) NTLMUnauthenticatedBind(domain, username string) error {
 	req := &NTLMBindRequest{
 		Domain:             domain,
-		Username:           username,
-		Password:           "",
-		AllowEmptyPassword: true,
+		createNegotiateMessage: func() ([]byte, error) {
+			return ntlmssp.NewNegotiateMessage(domain, "")
+		},
+		processChallenge: func(challenge []byte) ([]byte, error) {
+			return ntlmssp.ProcessChallenge(challenge, username, "")
+		},
 	}
 	_, err := l.NTLMChallengeBind(req)
 	return err
@@ -463,10 +466,17 @@ func (l *Conn) NTLMUnauthenticatedBind(domain, username string) error {
 
 // NTLMBindWithHash performs an NTLM Bind with an NTLM hash instead of plaintext password (pass-the-hash)
 func (l *Conn) NTLMBindWithHash(domain, username, hash string) error {
+	if hash == "" {
+		return NewError(ErrorEmptyPassword, errors.New("ldap: empty password not allowed by the client"))
+	}
 	req := &NTLMBindRequest{
-		Domain:   domain,
-		Username: username,
-		Hash:     hash,
+		Domain: domain,
+		createNegotiateMessage: func() ([]byte, error) {
+			return ntlmssp.NewNegotiateMessage(domain, "")
+		},
+		processChallenge: func(challenge []byte) ([]byte, error) {
+			return ntlmssp.ProcessChallengeWithHash(challenge, username, hash)
+		},
 	}
 	_, err := l.NTLMChallengeBind(req)
 	return err
@@ -474,10 +484,6 @@ func (l *Conn) NTLMBindWithHash(domain, username, hash string) error {
 
 // NTLMChallengeBind performs the NTLMSSP bind operation defined in the given request
 func (l *Conn) NTLMChallengeBind(ntlmBindRequest *NTLMBindRequest) (*NTLMBindResult, error) {
-	if !ntlmBindRequest.AllowEmptyPassword && ntlmBindRequest.Password == "" && ntlmBindRequest.Hash == "" {
-		return nil, NewError(ErrorEmptyPassword, errors.New("ldap: empty password not allowed by the client"))
-	}
-
 	msgCtx, err := l.doRequest(ntlmBindRequest)
 	if err != nil {
 		return nil, err
@@ -512,16 +518,8 @@ func (l *Conn) NTLMChallengeBind(ntlmBindRequest *NTLMBindRequest) (*NTLMBindRes
 		}
 	}
 	if ntlmsspChallenge != nil {
-		var err error
-		var responseMessage []byte
 		// generate a response message to the challenge with the given Username/Password if password is provided
-		if ntlmBindRequest.Hash != "" {
-			responseMessage, err = ntlmssp.ProcessChallengeWithHash(ntlmsspChallenge, ntlmBindRequest.Username, ntlmBindRequest.Hash)
-		} else if ntlmBindRequest.Password != "" || ntlmBindRequest.AllowEmptyPassword {
-			responseMessage, err = ntlmssp.ProcessChallenge(ntlmsspChallenge, ntlmBindRequest.Username, ntlmBindRequest.Password)
-		} else {
-			err = fmt.Errorf("need a password or hash to generate reply")
-		}
+		responseMessage, err := ntlmBindRequest.processChallenge(ntlmsspChallenge)
 		if err != nil {
 			return result, fmt.Errorf("parsing ntlm-challenge: %s", err)
 		}
